@@ -1,0 +1,734 @@
+---
+title: "XGBoost and Parameter Tuning in R"
+output: html_notebook
+---
+
+目录
+
++ 1 XGBoost的优势
++ 2 XGBoost的工作原理
++ 3 XGBoost的参数
++ 4 XGBoost在R中的调参实践
+    + 4.0 AUC & KS函数、网格搜索函数、载入数据集
+        + 4.0.1 AUC & KS函数
+        + 4.0.2 网格搜索函数
+        + 4.0.3 载入数据集
+    + 4.1 在较高的学习速率下，进行决策树参数调优
+        + 4.1.1 max_depth 和 min_child_weight 参数调优
+        + 4.1.2 gamma 参数调优
+        + 4.1.3 subsample 和 colsample_bytree 参数调优
+    + 4.2 alpha 和 lambda 正则化参数调优
+    + 4.3 对所有参数进行网格搜索
+    + 4.4 降低学习速率
++ 5 模型评价
+    + 5.1 混淆矩阵
+    + 5.2 ROC曲线
+    + 5.3 训练集、交叉验证AUC相对于训练轮次的变化趋势图
++ 6 模型训练
++ 7 模型可解释性
+    + 7.1 特征重要性评分
+    + 7.2 绘制特征重要性评分
+    + 7.3 解释变量的作用
+    + 7.4 绘制模型
++ 8 随机森林
+    + 8.1 模型训练
+    + 8.2 模型评价
+    + 8.3 特征重要性评分
+
+# 1 XGBoost的优势
++ 1.并行计算：使用OpenMP进行并行计算，默认使用计算机的所有核
+
++ 2.正则化：XGBoost最大的优势在于可以正则化，防止过拟合
+
++ 3.交叉验证：XGBoost内置交叉验证函数
+
++ 4.缺失值：XGBoost可以处理缺失值，模型可以捕捉到缺失值蕴含的趋势
+
++ 5.灵活性：支持用户自定义目标函数和评价指标
+
++ 6.可获得性：XGBoost支持R, Python, Java, Julia, Scala 等语言
+
++ 7.保存和载入：XGBoost可以保存和载入数据矩阵和模型
+
++ 8.剪枝：XGBoost首先建立最大深度的树，再自下而上剪去损失函数的减少低于阈值的树枝
+
+# 2 XGBoost的工作原理
++ 1.分类问题：使用`booster = gbtree`参数。每一棵树都是在之前树的基础上建立，通过给之前的树误分的点赋予更高的权重，来降低接下来轮次中的误分率。
+
++ 2.回归问题：使用`booster = gbtree` 和 `booster = gblinear`参数。使用`gblinear`参数时，建立广义线性模型，并使用（L1,L2）正则化和梯度下降法。后续的模型都是对之前模型的残差进行拟合。
+
+# 3 XGBoost的参数
+XGBoost的参数可以被分为3类：  
+
++ General Parameters: Controls the booster type in the model which eventually drives overall functioning
++ Booster Parameters: Controls the performance of the selected booster
++ Learning Task Parameters: Sets and evaluates the learning process of the booster from the given data
+
+### 1.General Parameters
+##### 1.Booster[default=gbtree]
+设置booster类型（gbtree, gblinear, dart）。对于分类问题，可以使用gbtree, gblinear；对于回归问题，可以使用任何类型。
+
+##### 2.nthread[default=maximum cores available]
+启动并行计算。通常不需要改变这一参数，因为默认使用所有核，可以带来最快的计算速度。
+
+##### 3.silent[default=0]
+如果设为1，R console会被运行信息淹没，最好不要改变改变这一参数。
+
+### 2.Booster Parameters
+#### 2.1 Parameters for Tree Booster
+##### 1.nrounds[default=100]
++ 控制最大迭代次数。对于分类问题，相当于建立的树的棵树
++ 使用CV进行调参
+
+##### 2.eta[default=0.3][range: (0,1)]
++ 控制学习速率，即模型学习数据模式的速率。每一轮次后，模型都会压缩特征权重以达到最优化
++ 较低的eta降低计算速度，需要配合更高的nrounds
++ 典型的取值在0.01 - 0.3
+
+##### 3.gamma[default=0][range: (0,Inf)]
++ 控制正则化（防止过拟合）。gamma的最优取值取决于数据集和其他参数值
++ 取值越高，正则化力度越大。正则化意味着对没有改善模型表现且取值较大的参数施以惩罚。默认值为0，意味着没有正则化
++ 调参技巧：先将参数值设为0。检查交叉验证错误率，如果train error >>> test error，则引入gamma参数。gamma值越高，训练集和测试集的差距越小。如果树的深度（max_depth）较小，gamma参数会带来性能的提升
+
+##### 4.max_depth[default=6][range: (0,Inf)]
++ 控制树的深度
++ 树的深度越大，模型越复杂，过拟合的可能性越大。这一参数没有标准取值。更大的数据集，需要更深的树深度。
++ 使用CV进行调参
+
+##### 5.min_child_weight[default=1][range:(0,Inf)]
++ 在回归中，代表每一个子节点中的最小样本数。在分类中，如果子节点的样本权重之和（由二阶偏导数计算得到）小于该参数值，则停止分裂
+
+##### 6.subsample[default=1][range: (0,1)]
++ 控制每一棵树使用的样本数
++ 典型的取值在0.5 - 0.8
+
+##### 7.colsample_bytree[default=1][range: (0,1)]
++ 控制每一棵树使用的特征数
++ 典型的取值在0.5 - 0.9
+
+##### 8.lambda[default=1]
++ 控制L2正则化（相当于岭回归），用来防止过拟合
+
+##### 9.alpha[default=0]
++ 控制L1正则化（相当于lasso回归），用来防止过拟合，还可以用来做特征选择，在高维数据集中更有用
+
+##### 10.scale_pos_weight[default=1]
++ 控制正负例的权重，对不平衡数据集有用。可以考虑设置为负例数/正例数。
+
+#### 2.2 Parameters for Linear Booster
+##### 1.nrounds[default=100]
++ 控制最大迭代次数
++ 使用CV进行调参
+
+##### 2.lambda[default=0]
++ 控制L2正则化，即岭回归，用来防止过拟合
+
+##### 3.alpha[default=0]
++ 控制L1正则化，即lasso回归，用来防止过拟合
+
+#### 2.3 Learning Task Parameters
+##### 1.Objective[default=reg:linear]
++ reg:linear - for linear regression
++ binary:logistic - logistic regression for binary classification. It returns class probabilities
++ multi:softmax - multiclassification using softmax objective. It returns predicted class labels. It requires setting num_class parameter denoting number of unique prediction classes.
++ multi:softprob - multiclassification using softmax objective. It returns predicted class probabilities.
+
+##### 2.eval_metric [no default, depends on objective selected]
++ 用来评估模型在验证集上的准确率。对于回归问题，默认评价指标为RMSE；对于分类问题，默认评价指标为error
++ 可选的评价指标如下：  
+    + mae - Mean Absolute Error (used in regression)
+    + Logloss - Negative loglikelihood (used in classification)
+    + AUC - Area under curve (used in classification)
+    + RMSE - Root mean square error (used in regression)
+    + error - Binary classification error rate [#wrong cases/#all cases]
+    + mlogloss - multiclass logloss (used in classification)
+
+# 4 XGBoost在R中的调参实践
+调参策略：  
+
++ 1.选择较高的学习速率(eta)。一般情况下，初始学习速率的值为0.1。但是，对于不同的问题，理想的学习速率有时候会在0.05到0.3之间波动。通过xgb.cv函数的early_stopping_rounds参数来控制最优的决策树数量(nrounds)。对于给定的学习速率，进行决策树特定参数调优(max_depth, min_child_weight, gamma, subsample, colsample_bytree)。
+
++ 2.XGBoost的正则化参数的调优。(lambda, alpha)。这些参数可以降低模型的复杂度，从而提高模型的表现。
+
++ 3.结合scale_pos_weight参数，在利用贪婪算法调整得到的参数组合附近，对所有参数进行网格搜索。
+
++ 4.降低学习速率，确定理想的决策树数量(nrouds)。
+
+## 4.0 AUC & KS函数、网格搜索函数、载入数据集
+### 4.0.1 AUC & KS函数
+```{r}
+library(ROCR)
+calc_auc_and_ks <- function(pred, y) {
+  pred.obj1 <- ROCR::prediction(pred, y)
+  
+  ## AUC
+  auc.tmp1 <- performance(pred.obj1, "auc")
+  auc1 <- as.numeric(auc.tmp1@y.values)
+  
+  ## KS
+  roc.tmp1 <- performance(pred.obj1, "tpr", "fpr")
+  ks <- max(attr(roc.tmp1, "y.values")[[1]] - attr(roc.tmp1, "x.values")[[1]])
+  
+  # print(c(auc1, ks))
+  return(list(auc1, ks))
+}
+
+# get cv-auc, cv-ks:
+# cv_prediction <- xgb$pred
+# calc_auc_and_ks(cv_prediction, y_train)
+```
+
+### 4.0.2 网格搜索函数
+```{r}
+grid_search <- function(dtrain, y_train,
+                        seed = 10, nthread=20, missing=NA, nrounds=10000, early_stopping_rounds=50, nfold=5, stratified=T, verbose=F, prediction = T,
+                        eta=c(0.1),
+                        max_depth=c(6),
+                        min_child_weight=c(1),
+                        gamma= c(0),
+                        subsample=c(1),
+                        colsample_bytree =c(1),
+                        lambda = c(1),
+                        alpha =c(0),
+                        scale_pos_weight=c(1)){
+
+  # create output data.frame：param(sep by ,), auc, ks,  auc_rank, ks_rank.
+  output_df <- data.frame(t(rep(NA,11)))
+  names(output_df) <- c("eta", "max_depth","min_child_weight","gamma","subsample","colsample_bytree","lambda","alpha","scale_pos_weight","cv_auc","cv_ks")
+  rowkey <-1
+  
+  # create parameters grid
+  to_tune = expand.grid(eta = eta,
+  						max_depth = max_depth,
+  						min_child_weight = min_child_weight,
+  						gamma = gamma,
+  						subsample = subsample,
+  						colsample_bytree = colsample_bytree,
+  						lambda = lambda,
+  						alpha = alpha,
+  						scale_pos_weight = scale_pos_weight)
+
+  # for loop
+  for (i in seq(dim(to_tune)[1])) {
+    
+  	xgb_params = list(
+  	  objective = "binary:logistic",
+  		eval_metric = 'auc')
+
+  	  xgb_params$eta = to_tune[i, 1]
+  	  xgb_params$max_depth = to_tune[i, 2]
+  	  xgb_params$min_child_weight = to_tune[i, 3]
+  	  xgb_params$gamma = to_tune[i, 4]
+  	  xgb_params$subsample = to_tune[i, 5]
+  	  xgb_params$colsample_bytree = to_tune[i, 6]
+  	  xgb_params$lambda = to_tune[i, 7]
+  	  xgb_params$alpha = to_tune[i, 8]
+  	  xgb_params$scale_pos_weight = to_tune[i, 9]
+
+  	set.seed(seed)
+  	start_tm <-Sys.time()
+  	xgb = xgb.cv(data = dtrain,
+  				 params = xgb_params,
+  				 nthread = nthread,
+  				 missing = missing,
+  				 nrounds = nrounds,
+  				 early_stopping_rounds = early_stopping_rounds,
+  				 nfold = nfold,
+  				 stratified = stratified,
+  				 verbose = verbose,
+  				 prediction = prediction
+  		)
+  	end_tm<-Sys.time()
+#  	print(paste0(rowkey, ' run time:', end_tm - start_tm))
+
+    # get cv-auc, cv-ks:
+  	cv_prediction <- xgb$pred
+  	list_auc_ks <- calc_auc_and_ks(cv_prediction, y_train)
+  	auc_i <- list_auc_ks[[1]]
+  	ks_i <- list_auc_ks[[2]]
+  	
+  	# fill the output_df
+  	output_df[rowkey,] <- as.data.frame(t(c(xgb_params$eta, xgb_params$max_depth, xgb_params$min_child_weight, xgb_params$gamma, xgb_params$subsample, xgb_params$colsample_bytree, xgb_params$lambda, xgb_params$alpha, xgb_params$scale_pos_weight, auc_i, ks_i)))
+  	
+#  	print(paste0("rowkey=", rowkey, ">>parameters:eta=", xgb_params$eta, ",max_depth=", xgb_params$max_depth, ",min_child_weight=", xgb_params$min_child_weight, ",gamma=", xgb_params$gamma, ",subsample=", xgb_params$subsample, ",colsample_bytree=", xgb_params$colsample_bytree, ",lambda=", xgb_params$lambda, ",alpha=", xgb_params$alpha, ",scale_pos_weight=", xgb_params$scale_pos_weight))
+#  	print(paste0("rowkey=",rowkey,": auc=",auc_i,", ks=",ks_i,"...."))
+  	
+  	rowkey <- rowkey +1
+  }
+
+  # Rank the auc, ks descending.
+  output_df[,"desc_rank_auc"] <- dim(output_df)[1]+1 - as.data.frame(rank(output_df[,"cv_auc"]))
+  output_df[,"desc_rank_ks"] <- dim(output_df)[1]+1 - as.data.frame(rank(output_df[,"cv_ks"]))
+
+  return(output_df)
+}
+```
+
+### 4.0.3 载入数据集
+```{r}
+library(xgboost)
+library(dplyr)
+
+df_train = read.csv("data/cs-training.csv", stringsAsFactors = FALSE) %>%
+  na.omit() %>%  # delete the missing value
+  select(-`X`)   # delete the first index column
+
+train_data = as.matrix(df_train %>% select(-SeriousDlqin2yrs))
+train_label = df_train$SeriousDlqin2yrs
+
+dtrain <- xgb.DMatrix(data = train_data, label = train_label)
+```
+
+
+## 4.1 在较高的学习速率下，进行决策树参数调优
+max_depth 、 min_child_weight 、 gamma 、 subsample 、 colsample_bytree
+
+### 4.1.1 max_depth 和 min_child_weight 参数调优
+先大范围地粗调参数，然后再小范围地微调；取决于机器的性能，可以适当放宽网格搜索的范围、减少参数的步长。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(3, 5, 7, 9),          # initial value set to [3-9]
+                                 min_child_weight = c(1, 3, 5),      # initial value set to [1-5]
+                                 gamma = c(0),                       # initial value set to 0
+                                 subsample = c(0.8),                 # typical initial value set to 0.8, can be set to [0.5, 0.9]
+                                 colsample_bytree = c(0.8),          # typical initial value set to 0.8, can be set to [0.5, 0.9]
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+```
+
+```{r}
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的max_depth值为3，理想的min_child_weight值为5，但是我们还没尝试过小于3的max_depth取值和大于5的min_child_weight取值，所以继续在这一参数组合附近搜索。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(1, 3, 5),
+                                 min_child_weight = c(3, 5, 7),
+                                 gamma = c(0),
+                                 subsample = c(0.8),
+                                 colsample_bytree = c(0.8),
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的max_depth值仍然为3，理想的min_child_weight值仍然为5。在这个参数组合附近进一步调整，将步长设置为1，寻找理想的参数组合。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(2, 3, 4),
+                                 min_child_weight = c(4, 5, 6),
+                                 gamma = c(0),
+                                 subsample = c(0.8),
+                                 colsample_bytree = c(0.8),
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+最终确定，理想的max_depth值为3，理想的min_child_weight值为5。
+
+### 4.1.2 gamma 参数调优
++ Gamma Tuning
+    + Always start with 0, use xgb.cv, and look how the train/test are faring. If you train CV skyrocketing over test CV at a blazing speed, this is where Gamma is useful instead of min_child_weight (because you need to control the complexity issued from the loss, not the loss derivative from the hessian weight in min_child_weight). Another choice typical and most preferred choice: step max_depth down.
+    + If Gamma is useful (i.e train CV skyrockets at godlike speed when test CV can’t follow), crank up Gamma. This is where the experience with tuning Gamma is useful (so you lose the lowest amount of time). Depending on what you see between the train/test CV increase speed, you try to find an appropriate Gamma. The higher the Gamma, the lower the difference between train/test CV will happen. If you have no idea of the value to use, put 10 and look what happens.
+
++ How to set Gamma values?
+    + If your train/test CV are always lying too close, it means you controlled way too much the complexity of xgboost, and the model can’t grow trees without pruning them (due to the loss threshold not reached thanks to Gamma). Lower Gamma (good relative value to reduce if you don’t know: cut 20% of Gamma away until you test CV grows without having the train CV frozen).
+    + If your train/test CV are differing too much, it means you did not control enough the complexity of xgboost, and the model grows too many trees without pruning them (due to the loss threshold not reached because of Gamma). Put a higher Gamma (good absolute value to use if you don’t know: +2, until your test CV can follow faster your train CV which goes slower, your test CV should be able to peak).
+    + If your train CV is stuck (not increasing, or increasing way too slowly), decrease Gamma: that value was too high and xgboost keeps pruning trees until it can find something appropriate (or it may end in an endless loop of testing + adding nodes but pruning them straight away…).
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(3),
+                                 min_child_weight = c(5),
+                                 gamma = c(0, 0.01, 0.1, 1, 3, 5, 10, 20),
+                                 subsample = c(0.8),
+                                 colsample_bytree = c(0.8),
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的gamma值为3，在这一参数值附近进一步调整，将步长设置为1。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(3),
+                                 min_child_weight = c(5),
+                                 gamma = c(2, 3, 4),
+                                 subsample = c(0.8),
+                                 colsample_bytree = c(0.8),
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+最终确定，理想的gamma值为3。
+
+### 4.1.3 subsample 和 colsample_bytree 参数调优
+在0.6到1.0的范围内，以0.1为步长，对subsample和colsample_bytree进行网格搜索。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(3),
+                                 min_child_weight = c(5),
+                                 gamma = c(3),
+                                 subsample = c(0.6, 0.7, 0.8, 0.9, 1.0),
+                                 colsample_bytree = c(0.6, 0.7, 0.8, 0.9, 1.0),
+                                 lambda = c(1),
+                                 alpha = c(0),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+最终确定，理想的subsample值为0.7，理想的colsample_bytree值为0.8。
+
+### 4.2 alpha 和 lambda 正则化参数调优
+gamma参数提供了一种更加有效地降低过拟合的方法，因而alpha和lambda参数可以进行较为粗略的调整。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(3),
+                                 min_child_weight = c(5),
+                                 gamma = c(3),
+                                 subsample = c(0.7),
+                                 colsample_bytree = c(0.8),
+                                 lambda = c(0, 1e-5, 1e-2, 0.1, 1, 100),
+                                 alpha = c(0, 1e-5, 1e-2, 0.1, 1, 100),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的lambda值为100，理想的alpha值为1。
+
+### 4.3 对所有参数进行网格搜索
+
+```{r}
+weight = (length(train_label) - sum(train_label)) / sum(train_label)
+
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.1),
+                                 max_depth = c(2, 3, 4),
+                                 min_child_weight = c(4, 5, 6),
+                                 gamma = c(2, 3, 4),
+                                 subsample = c(0.6, 0.7, 0.8),
+                                 colsample_bytree = c(0.7, 0.8, 0.9),
+                                 lambda = c(100),
+                                 alpha = c(1),
+                                 scale_pos_weight = c(1, weight))
+```
+
+```{r}
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+最终确定，max_depth值为4，min_child_weight值为5，gamma值为3，subsample值为0.6，colsample_bytree为0.9，lambda值为100，alpha值为1，scale_pos_weight值为1。
+
+### 4.4 降低学习速率
+以10倍为步长降低学习速率，eta分别取0.001， 0.01， 0.1进行搜索。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.001, 0.01, 0.1),
+                                 max_depth = c(4),
+                                 min_child_weight = c(5),
+                                 gamma = c(3),
+                                 subsample = c(0.6),
+                                 colsample_bytree = c(0.9),
+                                 lambda = c(100),
+                                 alpha = c(1),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的eta值为0.1，在0.1附近以0.05为步长进一步搜索。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.05, 0.1, 0.15, 0.2, 0.25, 0.3),
+                                 max_depth = c(4),
+                                 min_child_weight = c(5),
+                                 gamma = c(3),
+                                 subsample = c(0.6),
+                                 colsample_bytree = c(0.9),
+                                 lambda = c(100),
+                                 alpha = c(1),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+理想的eta值为0.1，在0.1附近以0.01为步长进一步搜索。
+
+```{r}
+grid_search_result = grid_search(dtrain, train_label,
+                                 eta = c(0.06, 0.07, 0.08, 0.09, 0.1, 0.11, 0.12, 0.13, 0.14),
+                                 max_depth = c(4),
+                                 min_child_weight = c(5),
+                                 gamma = c(3),
+                                 subsample = c(0.6),
+                                 colsample_bytree = c(0.9),
+                                 lambda = c(100),
+                                 alpha = c(1),
+                                 scale_pos_weight = c(1))
+
+grid_search_result
+```
+
+```{r}
+grid_search_result %>% filter(desc_rank_auc == 1)
+```
+
+最终确定，理想的eta值为0.12，找出该eta值下对应的nrounds。
+
+```{r}
+bst_params = list(objective = "binary:logistic",
+                  eval_metric = 'auc',
+                  eta = c(0.12),
+                  max_depth = c(4),
+                  min_child_weight = c(5),
+                  gamma = c(3),
+                  subsample = c(0.6),
+                  colsample_bytree = c(0.9),
+                  lambda = c(100),
+                  alpha = c(1),
+                  scale_pos_weight = c(1))
+
+set.seed(10)
+bst_cv = xgb.cv(data = dtrain,
+		      	 params = bst_params,
+		      #	 nthread = 20,
+		      	 missing = NA,
+		      	 nrounds = 10000,
+		      	 early_stopping_rounds = 50,
+		      	 nfold = 5,
+		      	 stratified = T,
+		      	 verbose = F,
+		      	 prediction = T
+	)
+```
+
+```{r}
+calc_auc_and_ks(bst_cv$pred, train_label)
+```
+
+```{r}
+bst_cv$niter
+```
+
+```{r}
+bst_cv$evaluation_log
+```
+
+最终确定，理想的nrounds为259。
+
+# 5 模型评价
+## 5.1 混淆矩阵
+```{r}
+library(caret)
+library(e1071)
+
+xgb_pred <- ifelse(bst_cv$pred > 0.5, 1, 0)
+
+confusionMatrix(xgb_pred, train_label)
+```
+
+## 5.2 ROC曲线
+```{r}
+library(pROC)
+modelroc = roc(train_label, bst_cv$pred, thresholds = 0.5)
+plot(modelroc,print.auc=T,auc.polygon=T,grid=c(0.1,0.2),grid.col=c('green','red'),max.auc.polygon=T,auc.polygon.col='skyblue',print.thres=T)
+```
+
+## 5.3 训练集、交叉验证AUC相对于训练轮次的变化趋势图
+```{r}
+library(tidyr)
+bst_cv$evaluation_log %>%
+  select(-contains("std")) %>%
+  gather(TestOrTrain, AUC, -iter) %>%
+  ggplot(aes(x = iter, y = AUC, group = TestOrTrain, color = TestOrTrain)) + 
+  geom_line() + 
+  theme_bw()
+```
+
+# 6 模型训练
+使用调节好的参数，通过xgb.train，在全部训练集上训练模型
+```{r}
+bst_params = list(objective = "binary:logistic",
+                  eval_metric = 'auc',
+                  eta = c(0.12),
+                  max_depth = c(4),
+                  min_child_weight = c(5),
+                  gamma = c(3),
+                  subsample = c(0.6),
+                  colsample_bytree = c(0.9),
+                  lambda = c(100),
+                  alpha = c(1),
+                  scale_pos_weight = c(1))
+
+bst = xgb.train(data = dtrain,
+                params = bst_params,
+                # nthread = 20,
+                missing = NA,
+                nrounds = 259,
+                verbose = F
+                )
+```
+
+# 7 模型可解释性
+## 7.1 特征重要性评分
+```{r}
+importance <- xgb.importance(feature_names = colnames(train_data), model = bst)
+importance
+```
+
++ Gain is the improvement in accuracy brought by a feature to the branches it is on. The idea is that before adding a new split on a feature X to the branch there was some wrongly classified elements, after adding the split on this feature, there are two new branches, and each of these branch is more accurate (one branch saying if your observation is on this branch then it should be classified as 1, and the other branch saying the exact opposite).
+
++ Cover measures the relative quantity of observations concerned by a feature.
+
++ Frequency is a simpler way to measure the Gain. It just counts the number of times a feature is used in all generated trees. You should not use it (unless you know why you want to use it).
+
+## 7.2 绘制特征重要性评分
+```{r}
+xgb.plot.importance(importance_matrix = importance) 
+```
+
+## 7.3 解释变量的作用
+```{r}
+importanceRaw <- xgb.importance(feature_names = colnames(train_data), model = bst, data = train_data, label = train_label)
+```
+
+```{r}
+importanceClean <- importanceRaw[,`:=`(Cover=NULL, Frequency=NULL)]
+```
+
+```{r}
+importanceClean
+```
+
+
+## 7.4 绘制模型
+```{r}
+bst_params = list(objective = "binary:logistic",
+                  eval_metric = 'auc',
+                  eta = c(0.12),
+                  max_depth = c(4),
+                  min_child_weight = c(5),
+                  gamma = c(3),
+                  subsample = c(0.6),
+                  colsample_bytree = c(0.9),
+                  lambda = c(100),
+                  alpha = c(1),
+                  scale_pos_weight = c(1))
+bst_graph = xgb.train(data = dtrain,
+                      params = bst_params,
+                      # nthread = 20,
+                      missing = NA,
+                      nrounds = 2,
+                      verbose = F
+                      )
+```
+
+
+```{r}
+library(DiagrammeR)
+xgb.plot.tree(model = bst_graph)
+```
+
+# 8 随机森林
+随机森林和梯度提升决策树都属于集成算法。两种算法都要在一个数据集上训练多个决策树，两者的区别在于：随机森林中的每一棵决策树是独立的，而在梯度提升决策树中，每一棵树都是在对前一棵树进行修正。
+
+## 8.1 模型训练
+通过XGBoost也可以实现随机森林，下面建立由1000棵决策树组成的随机森林。
+```{r}
+rf <- xgb.train(data = dtrain, max_depth = 4, num_parallel_tree = 1000, subsample = 0.8, colsample_bytree =0.8, nrounds = 1, objective = "binary:logistic", eval_metric = 'auc')
+```
+
+## 8.2 模型评价
+```{r}
+rf_pred <- predict(rf, dtrain)
+calc_auc_and_ks(rf_pred, train_label)
+```
+
+```{r}
+modelroc = roc(train_label, rf_pred, thresholds = 0.5)
+plot(modelroc,print.auc=T,auc.polygon=T,grid=c(0.1,0.2),grid.col=c('green','red'),max.auc.polygon=T,auc.polygon.col='skyblue',print.thres=T)
+```
+
+```{r}
+rf_pred <- if_else(rf_pred > 0.5, 1, 0)
+confusionMatrix(rf_pred, train_label)
+```
+
+## 8.3 特征重要性评分
+```{r}
+importance <- xgb.importance(feature_names = colnames(train_data), model = rf)
+importance
+```
+
+```{r}
+xgb.plot.importance(importance_matrix = importance) 
+```
